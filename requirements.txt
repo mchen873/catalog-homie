@@ -1,0 +1,8 @@
+pdf2image
+Pillow
+pandas
+numpy
+scikit-learn
+scipy
+openpyxl
+streamlit
