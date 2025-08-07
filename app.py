@@ -589,25 +589,42 @@ with st.sidebar:
         # Compute features and cluster images based on colour
         features = compute_color_histograms(images)
         labels = cluster_images(features, int(n_clusters))
-        # Load SKU data
-        try:
-            df_skus = pd.read_excel(excel_path)
-        # --- PG predictions from vendor category + title ---
-        if pg_model is not None:
-            vendor_cat_col = next((c for c in df_skus.columns if 'product category' in str(c).lower()), None)
-            title_col = next((c for c in df_skus.columns if 'title' in str(c).lower()), None)
-            if vendor_cat_col and title_col:
-                _text = df_skus[vendor_cat_col].astype(str) + ' ' + df_skus[title_col].astype(str)
-                try:
-                    _preds = pg_model.predict(_text)
-                    _confs = pg_model.predict_proba(_text).max(axis=1)
-                    df_skus['PG_pred'] = _preds
-                    df_skus['PG_confidence'] = np.round(_confs, 3)
-                except Exception as _exc:
-                    st.warning(f'PG prediction failed: {_exc}')
-            else:
-                st.info('Could not find Vendor Category / Product Title columns – PG prediction skipped.')
-        # -----------------------------------------------------
+       # --- Load SKU data and run PG prediction safely --------------------------------
+try:
+    df_skus = pd.read_excel(excel_path)
+    if len(df_skus) == 0:
+        st.error("The SKU file is empty.")
+        return
+
+    # ===== PG predictions (inside the try) =====
+    if pg_model is not None:
+        # Heuristic column detection
+        vendor_cat_col = next((c for c in df_skus.columns if "product category" in str(c).lower()), None)
+        title_col      = next((c for c in df_skus.columns if "title" in str(c).lower()), None)
+
+        if vendor_cat_col and title_col:
+            text_series = df_skus[vendor_cat_col].astype(str) + " " + df_skus[title_col].astype(str)
+            try:
+                preds = pg_model.predict(text_series)
+                confs = pg_model.predict_proba(text_series).max(axis=1)
+                df_skus["PG_pred"] = preds
+                df_skus["PG_confidence"] = np.round(confs, 3)
+            except Exception as pred_exc:
+                st.warning(f"PG prediction failed: {pred_exc}")
+        else:
+            st.info("Could not find Vendor Category / Product Title columns – PG prediction skipped.")
+
+    # Use editable prediction as final PG for all downstream steps
+    if "PG_pred" in df_skus.columns:
+        df_skus["PG_final"] = df_skus["PG_pred"]
+    else:
+        # Fallback to an empty column if prediction didn't run
+        df_skus["PG_final"] = ""
+
+except Exception as exc:
+    st.error(f"Failed to read Excel file: {exc}")
+    return
+# -------------------------------------------------------------------------------
 
         except Exception as exc:
             st.error(f"Failed to read Excel file: {exc}")
