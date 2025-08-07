@@ -626,7 +626,7 @@ except Exception as exc:
     return
 # -------------------------------------------------------------------------------
 
-        except Exception as exc:
+      except Exception as exc:
             st.error(f"Failed to read Excel file: {exc}")
             return
         if len(df_skus) == 0:
