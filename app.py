@@ -1,13 +1,13 @@
 """
-Product Catalog + PG Classifier (MODEL-ONLY)
+Product Catalog + PG Classifier (MODEL ONLY, with MD filter + Run button)
 
-- Upload PDF (catalog) + Excel (SKUs)
-- Extract product images from PDF
-- (Optional) OCR each image and match to SKU rows (else sequential)
-- Load a cached scikit-learn PG classifier from disk
-- Predict PG per row from Vendor Category + Product Title
-- Let the user edit predictions; export Excel with images + PG_final
-- Sidebar button to batch retrain model from /training_data via retrain_pg_model.py
+- Upload PDF + Excel
+- (Optional) Upload Taxonomy (MD/PG) to constrain suggestions
+- Click "Run classification" to process
+- Predict PG per row using Vendor Category + Product Title (scikit-learn model)
+- Filter predictions to selected MDs (if taxonomy provided)
+- Edit predictions; export Excel with images + PG_final
+- Sidebar button retrains model from /training_data via retrain_pg_model.py
 """
 
 import os
@@ -27,7 +27,7 @@ from scipy import ndimage
 from openpyxl.drawing.image import Image as XLImage
 import openpyxl.utils
 
-# Optional OCR / fuzzy (gracefully degrade if absent)
+# Optional OCR/fuzzy (gracefully degrade if missing)
 try:
     import pytesseract  # type: ignore
 except Exception:
@@ -46,7 +46,7 @@ import joblib
 # ──────────────────────────────────────────────────────────────────────────────
 
 PG_MODEL_CANDIDATES = [
-    "models/pg_classifier_latest.joblib",
+    "models/pg_classifier_latest.joblib",  # preferred
     "models/pg_classifier_final.joblib",   # fallback
     "./pg_classifier_latest.joblib",
     "./pg_classifier_final.joblib",
@@ -77,10 +77,11 @@ def extract_images_from_pdf(
     min_area_ratio: float = 0.02,
     max_images_per_page: int = 1,
 ) -> List[Image.Image]:
-    """Convert PDF pages into images and crop large non‑white regions."""
+    """Convert PDF pages into PIL images and crop large non‑white regions."""
     out: List[Image.Image] = []
     pages = convert_from_path(pdf_path, dpi=200)
     for page in pages:
+        # downsample for faster component analysis
         scale = 4
         small = page.resize((max(1, page.width // scale), max(1, page.height // scale)))
         arr = np.array(small.convert("L"))
@@ -91,9 +92,9 @@ def extract_images_from_pdf(
         objects = ndimage.find_objects(labeled)
         page_area = small.width * small.height
         bboxes: List[Tuple[int, Tuple[int, int, int, int]]] = []
-        for slc in objects:
-            y0, y1 = slc[0].start, slc[0].stop
-            x0, x1 = slc[1].start, slc[1].stop
+        for sl in objects:
+            y0, y1 = sl[0].start, sl[0].stop
+            x0, x1 = sl[1].start, sl[1].stop
             area = (x1 - x0) * (y1 - y0)
             if page_area and (area / page_area) >= min_area_ratio:
                 bboxes.append((area, (x0, y0, x1, y1)))
@@ -116,7 +117,7 @@ def extract_images_from_pdf(
 # ──────────────────────────────────────────────────────────────────────────────
 
 def ocr_extract_texts(images: List[Image.Image]) -> List[str]:
-    """OCR each image; return empty strings if OCR unavailable or fails."""
+    """OCR per image; return empty strings if OCR unavailable or fails."""
     if pytesseract is None:
         return ["" for _ in images]
     texts = []
@@ -209,13 +210,12 @@ def embed_images_to_excel(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# APP
+# HELPERS
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _norm(s: str) -> str:
     """Normalize header: collapse whitespace/newlines and lowercase."""
     return " ".join(str(s).replace("\n", " ").split()).strip().lower()
-
 
 def detect_cols(df: pd.DataFrame) -> tuple[str | None, str | None]:
     """Find vendor category and product title columns via common aliases."""
@@ -242,11 +242,76 @@ def detect_cols(df: pd.DataFrame) -> tuple[str | None, str | None]:
     return vendor, title
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# APP
+# ──────────────────────────────────────────────────────────────────────────────
+
 def main():
     st.set_page_config(page_title="Product Catalog + PG Classifier", layout="wide")
     st.title("Product Catalog + PG Classifier (model only)")
 
-    # Sidebar: retrain
+    # =================== TAXONOMY / MD FILTER (TOP) ==========================
+    st.subheader("Taxonomy / MD filter")
+    tax_file = st.file_uploader(
+        "Upload Taxonomy (optional; must contain columns 'MD' and 'PG')",
+        type=["xlsx", "xls", "xlsm"], key="tax_upload"
+    )
+
+    def load_taxonomy_df(_file):
+        try:
+            return pd.read_excel(_file)
+        except Exception as e:
+            st.warning(f"Could not read taxonomy: {e}")
+            return pd.DataFrame()
+
+    taxonomy_df = pd.DataFrame()
+    if tax_file is not None:
+        taxonomy_df = load_taxonomy_df(tax_file)
+    elif os.path.exists("Taxonomy.xlsx"):
+        taxonomy_df = load_taxonomy_df("Taxonomy.xlsx")
+
+    if not taxonomy_df.empty:
+        taxonomy_df.columns = [str(c).strip() for c in taxonomy_df.columns]
+        if not {"MD", "PG"}.issubset(taxonomy_df.columns):
+            st.warning("Taxonomy is missing required columns 'MD' and 'PG'. Ignoring it.")
+            taxonomy_df = pd.DataFrame()
+
+    md_options = sorted(taxonomy_df["MD"].dropna().unique().tolist()) if not taxonomy_df.empty else []
+    selected_mds = st.multiselect(
+        "Select MDs to constrain PG suggestions (leave empty to allow all PGs):",
+        md_options, default=md_options if md_options else None
+    )
+
+    allowed_pgs = set()
+    if not taxonomy_df.empty:
+        if selected_mds:
+            allowed_pgs = set(taxonomy_df[taxonomy_df["MD"].isin(selected_mds)]["PG"].dropna().astype(str))
+        else:
+            allowed_pgs = set(taxonomy_df["PG"].dropna().astype(str))
+
+    if taxonomy_df.empty:
+        st.caption("No taxonomy loaded — using full model label set.")
+    else:
+        if selected_mds:
+            st.caption(f"Restricting to {len(allowed_pgs)} PG(s) from MD(s): {', '.join(selected_mds)}")
+        else:
+            st.caption(f"Using all {taxonomy_df['PG'].nunique()} PG(s) from taxonomy.")
+
+    # =========================== INPUTS + RUN BUTTON =========================
+    st.subheader("Inputs")
+    pdf_file = st.file_uploader("Upload PDF catalog", type=["pdf"])
+    excel_file = st.file_uploader("Upload SKU Excel", type=["xlsx", "xls", "xlsm"])
+    use_ocr = st.checkbox(
+        "Use OCR to match images to rows (else sequential order)", value=True,
+        help="Requires pytesseract + system Tesseract. If unavailable, we fall back to sequential mapping."
+    )
+
+    run_clicked = st.button("▶ Run classification")
+    if not run_clicked:
+        st.info("Load files, adjust options, then click **Run classification**.")
+        return
+
+    # Sidebar: retrain (after Run button so it doesn't distract)
     with st.sidebar:
         st.markdown("### PG model")
         if st.button("🔄 Retrain from /training_data"):
@@ -271,16 +336,8 @@ def main():
         min_area_ratio = st.number_input("Min region area ratio", 0.0, 1.0, 0.02, 0.01)
         max_images_per_page = st.number_input("Max images per page", 1, 10, 1, 1)
 
-    pdf_file = st.file_uploader("Upload PDF catalog", type=["pdf"])
-    excel_file = st.file_uploader("Upload SKU Excel", type=["xlsx", "xls", "xlsm"])
-
-    use_ocr = st.checkbox(
-        "Use OCR to match images to rows (else sequential order)", value=True,
-        help="Requires pytesseract + system Tesseract. If unavailable, we fall back to sequential mapping."
-    )
-
     if not pdf_file or not excel_file:
-        st.info("Upload both a PDF and an Excel file to proceed.")
+        st.error("Please upload both a PDF and an Excel file.")
         return
 
     # Save uploads
@@ -314,9 +371,27 @@ def main():
 
         if pg_model is not None and vendor_cat_col and title_col:
             text_series = df_skus[vendor_cat_col].astype(str) + " " + df_skus[title_col].astype(str)
+
+            # Use probabilities so we can filter to selected MDs
             try:
-                preds = pg_model.predict(text_series)
-                confs = pg_model.predict_proba(text_series).max(axis=1)
+                proba = pg_model.predict_proba(text_series)           # (n_samples, n_classes)
+                classes = list(pg_model.classes_)
+
+                if allowed_pgs:
+                    allowed_idx = [i for i, c in enumerate(classes) if str(c) in allowed_pgs]
+                    if not allowed_idx:
+                        st.warning("Selected MDs have no PGs in the model. Using full label set.")
+                        best_idx = proba.argmax(axis=1)
+                    else:
+                        masked = np.full_like(proba, -1.0)
+                        masked[:, allowed_idx] = proba[:, allowed_idx]
+                        best_idx = masked.argmax(axis=1)
+                else:
+                    best_idx = proba.argmax(axis=1)
+
+                preds = np.array(classes, dtype=object)[best_idx]
+                confs = proba[np.arange(len(proba)), best_idx]
+
                 df_skus["PG_pred"] = preds
                 df_skus["PG_confidence"] = np.round(confs, 3)
             except Exception as pred_exc:
